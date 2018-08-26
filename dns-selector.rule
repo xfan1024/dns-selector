@@ -1,0 +1,45 @@
+# 规则说明
+#   1. 通配           以*开头的域名只能默认匹配子域名，不匹配域名本身，*只可单独出现在最左边
+#         www.*.com         错误
+#         w*.qq.com         错误
+#         *.qq.com          正确
+#         *                 正确，这是唯一一个可以不用*.开头的规则，该规则代表默认规则
+#
+#   2. 完全匹配       以$开头的域名会完全匹配$后面所跟的内容，不会匹配该域名的子域名
+#         $baidu.com        正确，该规则只匹配baidu.com，不匹配www.baidu.com
+#
+#   3. 普通匹配       不用任何修饰符号代表普通匹配，普通匹配模式下可以匹配子域名和本身
+#          taobao.com       正确，该规则相当于$taobao.com和*.taobao.com两条规则
+# 
+
+[default]
+server=114.114.114.114,114.114.115.115
+*
+# 默认通过 114.114.114.114, 114.114.115.115 解析
+
+[gitlab]
+answer=192.168.100.2
+$gitlab.lan
+$code-server.lan
+# gitlab.lan 和 code-server.lan 解析到 192.168.100.2上
+
+[ftpserver]
+answer=192.168.100.3
+$ftpserver.lan
+# ftpserver.lan 解析到 192.168.100.3 上
+
+[test environment redirect]
+answer=192.168.100.4
+ourdomain.com
+# ourdomain.com 和 *.ourdomain.com 全部解析到 192.168.100.4 上
+
+[test environment exclude]
+server=114.114.114.114,114.114.115.115
+$mail.ourdomain.com
+# 给上一条规则加一个例外，mail.ourdomain.com 通过 114.114.114.114, 114.114.115.115 进行解析
+
+[lan]
+server=192.168.1.53
+*.lan
+# 把 *.lan 通过 192.168.1.53 进行解析
+
