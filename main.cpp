@@ -21,14 +21,15 @@ namespace regns = boost;
 #include "utils.hpp"
 
 using namespace std;
+namespace asio = boost::asio;
 
-regns::regex pattern_start_resolver(R"(^\[([^\[\]]+)\]$)");
-
-using ipaddress = boost::asio::ip::address;
+static regns::regex pattern_start_resolver(R"(^\[([^\[\]]+)\]$)");
+static regns::regex pattern_v4_endpoint(R"(^([^:]+):(\d+)$)");
+static regns::regex pattern_v6_endpoint(R"(^\[([^\[\]]+)\]:(\d+)$)");
 
 struct DnsResolverHelper {
     string name;
-    vector<ipaddress> dnsaddr;
+    vector<asio::ip::udp::endpoint> dnsaddr;
     bool as_answer;
 };
 
@@ -42,6 +43,8 @@ struct DomainNode
 };
 
 class DnsRule {
+    using ip_address = asio::ip::address;
+    using udp_ep     = asio::ip::udp::endpoint;
 public:
     void parse_dns_rule(istream & stream)
     {
@@ -49,7 +52,7 @@ public:
         regns::smatch match;
         enum parse_state state = s_wait_resolver_name;
 
-        int lineno = 0;
+        lineno = 0;
         while (1)
         {
             line = getline_trim(stream);
@@ -71,7 +74,7 @@ public:
                 case s_wait_resolver_name: 
                 {
                     if (!is_resolver_name) {
-                        cerr << parse_dns_rule_error_prefix(lineno) << "expect resolver name" << endl;
+                        cerr << rule_error_prefix() << "expect resolver name" << endl;
                         exit(1);
                     }
                     resolver_groups.emplace_back();
@@ -91,26 +94,43 @@ public:
                         } else if (type == "answer") {
                             resolver.as_answer = true;
                         } else {
-                            cerr << parse_dns_rule_error_prefix(lineno) << "unknown resolver type: " << type << endl;
+                            cerr << rule_error_prefix() << "unknown resolver type: " << type << endl;
                             exit(1);
                         }
                         vector<string> address = string_split(line.substr(eqpos+1), ",");
                         if (resolver.as_answer && address.size() != 1) {
-                            cerr << parse_dns_rule_error_prefix(lineno) << "multiple anwser" << endl;
+                            cerr << rule_error_prefix() << "multiple anwser" << endl;
                             exit(1);
                         }
                         resolver.dnsaddr.clear();
                         for (const string& s : address) {
                             boost::system::error_code ec;
-                            resolver.dnsaddr.emplace_back(ipaddress::from_string(s, ec));
+                            udp_ep ep;
+                            if (regns::regex_match(line, match, pattern_v4_endpoint) || regns::regex_match(line, match, pattern_v6_endpoint)) {
+                                ip_address ip = ip_address::from_string(match[1].str(), ec);
+                                int port_integer = stoi(match[2].str());
+                                if (ec || port_integer < 0 || port_integer > 0xffff) {
+                                    cerr << rule_error_prefix() << "bad address" << endl;
+                                    exit(1);
+                                }
+                                ep = udp_ep(ip, (unsigned short)port_integer);
+                            } else {
+                                ip_address ip = ip_address::from_string(s, ec);
+                                if (ec) {
+                                    cerr << rule_error_prefix() << "bad address" << endl;
+                                    exit(1);
+                                }
+                                ep = udp_ep(ip, 53);
+                            }
+                            resolver.dnsaddr.emplace_back(ep);
                             if (ec) {
-                                cerr << parse_dns_rule_error_prefix(lineno) << "bad address: " << s << endl;
+                                cerr << rule_error_prefix() << "bad address: " << s << endl;
                                 exit(1);
                             }
                         }
                         state = s_wait_domain_pattern;
                     } else {
-                        cerr << parse_dns_rule_error_prefix(lineno) << "expect resolver type and address" << endl;
+                        cerr << rule_error_prefix() << "expect resolver type and address" << endl;
                         exit(1);
                     }
                     break;
@@ -148,6 +168,10 @@ public:
                 }
             }
         }
+        if (domain_root.child_resolv_index < 0) {
+            cerr << "no default rule found" << endl;
+            exit(1);
+        }
     }
 
     DnsResolverHelper& best_match(const string& domain)
@@ -182,15 +206,17 @@ public:
         return *match;
     }
 private:
+    int lineno;
     enum parse_state{
         s_wait_resolver_name,
         s_wait_resolver_addr,
         s_wait_domain_pattern,
     };
-    static string parse_dns_rule_error_prefix(int line)
+
+    string rule_error_prefix()
     {
         string res = "line ";
-        res += to_string(line);
+        res += to_string(lineno);
         res += " rule format error: ";
         return res;
     }
@@ -224,10 +250,10 @@ private:
 
 class DnsServer
 {
-    using udp_socket = boost::asio::ip::udp::socket;
-    using io_service = boost::asio::io_service;
-    using ip_address = boost::asio::ip::address;
-    using udp_ep = boost::asio::ip::udp::endpoint;
+    using udp_socket = asio::ip::udp::socket;
+    using io_service = asio::io_service;
+    using ip_address = asio::ip::address;
+    using udp_ep = asio::ip::udp::endpoint;
 
 public:
     DnsServer(io_service& service, DnsRule& rule) : usocket(service), rule(rule)
@@ -238,24 +264,24 @@ public:
         ip_address ipaddr = ip_address::from_string(addr);
         udp_ep ep(ipaddr, port);
         if (ipaddr.is_v4()) {
-            usocket.open(boost::asio::ip::udp::v4());
+            usocket.open(asio::ip::udp::v4());
         } else {
-            usocket.open(boost::asio::ip::udp::v6());
+            usocket.open(asio::ip::udp::v6());
         }
         usocket.bind(ep);
     }
     void start_receive_dns_request()
     {
-        namespace ph = boost::asio::placeholders;
+        namespace ph = asio::placeholders;
         const size_t bufsize = 768;
         shared_ptr<uint8_t> buffer(new uint8_t[bufsize]);
         shared_ptr<udp_ep> ep(new udp_ep); 
         
-        auto recvbuf = boost::asio::buffer(buffer.get(), bufsize);
+        auto recvbuf = asio::buffer(buffer.get(), bufsize);
         usocket.async_receive_from(recvbuf, *ep, boost::bind(&DnsServer::handle_dns_request, this, ph::error, ep, buffer, ph::bytes_transferred));
     }
 
-    static bool parse_dns_request(uint8_t * payload, size_t length, string& host)
+    static bool parse_dns_request(const uint8_t * payload, size_t length, string& host)
     {
         stringstream ss;
         const size_t header_size = 12;
@@ -286,8 +312,31 @@ public:
             }
         }
         return false;
-        
+    }
 
+    static string make_dns_response_v4(const uint8_t id[2], const string& host, const ip_address& addr)
+    {
+        stringstream ss;
+        static const uint8_t part1[] = {0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01};
+        static const uint8_t part2[] = {0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x4b, 0x00, 0x04};
+        ss << string((char*)id, 2) << string((char*)part1, sizeof(part1));
+        vector<string> arr = string_split(host, ".");
+        for (const string& s : arr)
+        {
+            ss << (char)s.length() << s;
+        }
+        ss << (char)0 <<  string((char*)part2, sizeof(part2));
+        asio::ip::address_v4 addrv4 = addr.to_v4();
+        auto addrb4bytes = addrv4.to_bytes();
+        for (auto byte : addrb4bytes) {
+            ss << (char)byte;
+        }
+        string s = ss.str();
+        for (char c : s) {
+            printf("%02x ", (uint8_t)c);
+        }
+        cout << endl;
+        return s;
     }
 
     void handle_dns_request(const boost::system::error_code& ec,
@@ -299,19 +348,27 @@ public:
             cerr << ec.message() << endl;
             return;
         }
+        cout << "request: " << endl;
+        for (size_t i = 0; i < nbytes; i++) {
+            printf("%02x ", buffer.get()[i]);
+        }
+        cout << endl;
         start_receive_dns_request();
         string host;
         if (parse_dns_request(buffer.get(), nbytes, host)) {
             cout << "Query " << host << endl;
             DnsResolverHelper& resolver = rule.best_match(host);
             if (resolver.as_answer) {
-                cout << "as answer: " << endl;
+                ip_address addr = resolver.dnsaddr.front().address();
+                string reply = make_dns_response_v4(buffer.get(), host, addr);
+                cout << "send reply" << endl;
+                usocket.send_to(asio::buffer(reply), *ep);
             } else {
                 cout << "us dns: " << endl;
             }
  
-            for (auto& addr : resolver.dnsaddr) {
-                cout << "    " << addr.to_string() << endl;
+            for (auto& ep : resolver.dnsaddr) {
+                cout << "    " << ep.address().to_string() << endl;
             }
         }
     }
@@ -322,6 +379,7 @@ public:
     }
 
 private:
+    int lineno;
     udp_socket usocket;
     DnsRule& rule;
 };
@@ -334,10 +392,11 @@ int main()
     DnsRule rule;
     rule.parse_dns_rule(config);
 
-    boost::asio::io_service io_service;
+    asio::io_service io_service;
     DnsServer server{io_service, rule};
-    server.listen_configure("0.0.0.0", 6666);
+    server.listen_configure("0.0.0.0", 53);
     server.start_receive_dns_request();
     io_service.run();
     return 0;
 }
+
