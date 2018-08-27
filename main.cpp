@@ -98,14 +98,13 @@ public:
                             exit(1);
                         }
                         vector<string> address = string_split(line.substr(eqpos+1), ",");
-                        if (resolver.as_answer && address.size() != 1) {
-                            cerr << rule_error_prefix() << "multiple anwser" << endl;
-                            exit(1);
-                        }
                         resolver.dnsaddr.clear();
                         for (const string& s : address) {
                             boost::system::error_code ec;
                             udp_ep ep;
+                            if (s.empty()) {
+                                continue;
+                            }
                             if (regns::regex_match(line, match, pattern_v4_endpoint) || regns::regex_match(line, match, pattern_v6_endpoint)) {
                                 ip_address ip = ip_address::from_string(match[1].str(), ec);
                                 int port_integer = stoi(match[2].str());
@@ -168,10 +167,16 @@ public:
                 }
             }
         }
+
         if (domain_root.child_resolv_index < 0) {
             cerr << "no default rule found" << endl;
             exit(1);
         }
+    }
+
+    DnsResolverHelper& default_resolver()
+    {
+        return resolver_groups[domain_root.child_resolv_index];
     }
 
     DnsResolverHelper& best_match(const string& domain)
@@ -254,9 +259,8 @@ class DnsServer
     using io_service = asio::io_service;
     using ip_address = asio::ip::address;
     using udp_ep = asio::ip::udp::endpoint;
-
 public:
-    DnsServer(io_service& service, DnsRule& rule) : usocket(service), rule(rule)
+    DnsServer(io_service& service, DnsRule& rule) : asio_service(service), usocket(service), rule(rule)
     {}
 
     void listen_configure(const string& addr, uint16_t port)
@@ -281,7 +285,147 @@ public:
         usocket.async_receive_from(recvbuf, *ep, boost::bind(&DnsServer::handle_dns_request, this, ph::error, ep, buffer, ph::bytes_transferred));
     }
 
-    static bool parse_dns_request(const uint8_t * payload, size_t length, string& host)
+private:
+    void handle_upstream_response(const boost::system::error_code& ec,
+                            shared_ptr<udp_ep> ep,
+                            shared_ptr< vector<udp_socket> > dns_clients,
+                            udp_socket& dns_client,
+                            shared_ptr<uint8_t> buffer, 
+                            size_t nbytes)
+    {
+        if (ec) {
+            if (ec == asio::error::operation_aborted) {
+                return;
+            }
+            cerr << __FUNCTION__ << ": " << ec.message() << endl;
+            return;
+        }
+        usocket.send_to(asio::buffer(buffer.get(), nbytes), *ep);
+        start_receive_dns_request();
+        for (auto& client : *dns_clients) {
+            client.close();
+        }
+    }
+
+    void handle_dns_request(const boost::system::error_code& ec,
+                            shared_ptr<udp_ep> ep, 
+                            shared_ptr<uint8_t> buffer, 
+                            size_t nbytes)
+    {
+        if (ec) {
+            cerr << __FUNCTION__ << ": " << ec.message() << endl;
+            return;
+        }
+        string host;
+        QType type;
+        
+        DnsResolverHelper * resolver_ptr = nullptr;
+        if (parse_dns_request(buffer.get(), nbytes, type, host)) {
+            cout << "Query " << host << endl;
+            DnsResolverHelper& r = rule.best_match(host);
+            resolver_ptr = &r;
+        } else {
+            cout << "could parse request, so using default resolver" << endl;
+            DnsResolverHelper& r = rule.default_resolver();
+            resolver_ptr = &r;
+        }
+
+
+        DnsResolverHelper& resolver = *resolver_ptr;
+
+        cout << "    ";
+        if (resolver.as_answer) {
+            cout << "          answer: ";
+        } else {
+            cout << "using dns server: ";
+        }
+        if (resolver.dnsaddr.empty()) {
+            cout << " <empty>";
+        } else {
+            bool first = true;
+            for (auto& ep : resolver.dnsaddr) {
+                if (first) {
+                    first = false;
+                } else {
+                    cout << ", ";
+                }
+                if (resolver.as_answer || ep.port() == 53) {
+                    cout << ep.address().to_string();
+                } else {
+                    if (ep.address().is_v4()) {
+                        cout << ep.address().to_string();
+                    } else {
+                        cout << "[" << ep.address().to_string() << "]";
+                    }
+                    cout << ":" << ep.port();
+                }
+            }
+        }
+        cout << endl;
+
+        if (resolver.as_answer) {
+            string reply = make_dns_response(buffer.get(), type, host, resolver.dnsaddr);
+            usocket.send_to(asio::buffer(reply), *ep);
+            start_receive_dns_request();
+        } else {
+            const size_t bufsize = 768;
+            shared_ptr<uint8_t> buffer_for_upstream(new uint8_t[bufsize]);
+            shared_ptr< vector<udp_socket> > dns_clients(new vector<udp_socket>);
+            auto recvbuf = asio::buffer(buffer_for_upstream.get(), bufsize);
+            namespace ph = asio::placeholders;
+
+            for (auto& server : resolver.dnsaddr) {
+                dns_clients->emplace_back(asio_service);
+                udp_socket& dns_client = dns_clients->back();
+
+                if (server.address().is_v4()) {
+                    dns_client.open(asio::ip::udp::v4());
+                } else {
+                    dns_client.open(asio::ip::udp::v6());
+                }
+                dns_client.connect(server);
+                auto callback = boost::bind(&DnsServer::handle_upstream_response, this, ph::error, ep, dns_clients, ref(dns_client), buffer_for_upstream, ph::bytes_transferred);
+                dns_client.send(asio::buffer(buffer.get(), nbytes));
+                dns_client.async_receive(recvbuf, callback);
+            }
+        }
+    }
+
+
+    enum QType { QType_A, QType_AAAA, QType_ANY, QType_UNKNOWN };
+
+    static QType qtype_decode(const uint8_t data[2]) {
+        if (data[0] == 0x00 && data[1] == 0x01) {
+            return QType_A;
+        } else if (data[0] == 0x00 && data[1] == 0x1c) {
+            return QType_AAAA;
+        } else if (data[0] == 0x00 && data[1] == 0xff) {
+            return QType_ANY;
+        } else {
+            return QType_UNKNOWN;
+        }
+    }
+
+    static void qtype_encode(QType type, uint8_t data[2]) {
+        data[0] = 0x00;
+        switch (type)
+        {
+        case QType_A:
+            data[1] = 0x01;
+            break;
+        case QType_AAAA:
+            data[1] = 0x1c;
+            break;
+        case QType_ANY:
+            data[1] = 0xff;
+            break;
+        default:
+            cerr << "no support qtype: " << (int)type << endl;
+            exit(1);
+        }
+    }
+
+    static bool parse_dns_request(const uint8_t * payload, size_t length, QType &type, string& host)
     {
         stringstream ss;
         const size_t header_size = 12;
@@ -291,19 +435,24 @@ public:
         }
 
         uint16_t questions = (payload[4] << 8) | payload[5];
-        if (questions == 0) {
+        if (questions != 1) {
             return false;
         }
         size_t curindex = header_size;
-        while (curindex < length - 3) {
+        while (curindex < length - 5) {
             size_t len = payload[curindex++];
-            if (len < 64 && curindex + len <= length - 3) {
+            if (len < 64 && curindex + len <= length - 5) {
                 ss << string((char*)&payload[curindex], len);
-                cerr << "debug: " << string((char*)&payload[curindex], len) << endl;
                 curindex += len;
                 if (payload[curindex]) {
                     ss << '.';
                 } else {
+                    curindex++;
+                    QType t = qtype_decode(&payload[curindex]);
+                    if (t == QType_UNKNOWN) {
+                        return false;
+                    }
+                    type = t;
                     host = ss.str();
                     return true;
                 }
@@ -314,72 +463,91 @@ public:
         return false;
     }
 
-    static string make_dns_response_v4(const uint8_t id[2], const string& host, const ip_address& addr)
+    static void make_dns_response_append_record(ostream& os, QType type, const uint8_t * data, uint16_t len)
+    {
+        uint8_t tmpdata[] = {
+                                0xc0, 0x0c,             // Name
+                                0x00, 0x00,             // type
+                                0x00, 0x01,             // class: IN
+                                0x00, 0x00, 0x02, 0x58, // ttl: 600
+                            };
+        qtype_encode(type, tmpdata+2);
+        os.write((char*)tmpdata, sizeof(tmpdata));
+        tmpdata[0] = len >> 8;
+        tmpdata[1] = len & 0xff;
+        os.write((char*)tmpdata, 2);
+        os.write((char*)data, len);
+    }
+
+    static string make_dns_response(const uint8_t id[2], QType type, const string& host, const vector<boost::asio::ip::udp::endpoint> vaddr)
     {
         stringstream ss;
-        static const uint8_t part1[] = {0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01};
-        static const uint8_t part2[] = {0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x4b, 0x00, 0x04};
-        ss << string((char*)id, 2) << string((char*)part1, sizeof(part1));
+        uint8_t part_header[] = { 
+            0x81, 0x80,     // flags
+            0x00, 0x01,     // Questions
+            0x00, 0x01,     // RRs 
+            0x00, 0x00,     // Authority RRs
+            0x00, 0x00,     // Additional RRs
+        };
+
+        boost::asio::ip::address_v4 addr_v4;
+        boost::asio::ip::address_v6 addr_v6;
+        bool reply_v4, reply_v6, v4, v6;
+        v4 = v6 = reply_v4 = reply_v6 = false;
+
+        if (type == QType_A) {
+            v4 = true;
+        } else if(type == QType_AAAA) {
+            v6 = true;
+        } else {
+            v4 = v6 = true;
+        }
+
+        uint8_t rrs = 0;
+        for (auto& ep : vaddr)
+        {
+            if (v4 && !reply_v4 && ep.address().is_v4()) {
+                rrs++;
+                reply_v4 = true;
+                addr_v4 = ep.address().to_v4();
+            }
+            if (v6 && !reply_v6 && ep.address().is_v6()) {
+                rrs++;
+                reply_v6 = true;
+                addr_v6 = ep.address().to_v6();
+            }
+        }
+        part_header[5] = rrs;
+        ss.write((char*)id, 2);
+        ss.write((char*)part_header, sizeof(part_header));
         vector<string> arr = string_split(host, ".");
         for (const string& s : arr)
         {
             ss << (char)s.length() << s;
         }
-        ss << (char)0 <<  string((char*)part2, sizeof(part2));
-        asio::ip::address_v4 addrv4 = addr.to_v4();
-        auto addrb4bytes = addrv4.to_bytes();
-        for (auto byte : addrb4bytes) {
-            ss << (char)byte;
+        ss << (char)0;
+        {
+            uint8_t data[4] = {0x00, 0x00, 0x00, 0x01};
+            qtype_encode(type, data);
+            ss.write((char*)data, 4);
         }
+        
+        if (reply_v4) {
+            auto data = addr_v4.to_bytes();
+            make_dns_response_append_record(ss, QType_A, data.data(), data.size());
+        }
+        if (reply_v6) {
+            auto data = addr_v6.to_bytes();
+            make_dns_response_append_record(ss, QType_AAAA, data.data(), data.size());
+        }
+
         string s = ss.str();
-        for (char c : s) {
-            printf("%02x ", (uint8_t)c);
-        }
-        cout << endl;
         return s;
     }
 
-    void handle_dns_request(const boost::system::error_code& ec,
-                            shared_ptr<udp_ep> ep, 
-                            shared_ptr<uint8_t> buffer, 
-                            size_t nbytes)
-    {
-        if (ec) {
-            cerr << ec.message() << endl;
-            return;
-        }
-        cout << "request: " << endl;
-        for (size_t i = 0; i < nbytes; i++) {
-            printf("%02x ", buffer.get()[i]);
-        }
-        cout << endl;
-        start_receive_dns_request();
-        string host;
-        if (parse_dns_request(buffer.get(), nbytes, host)) {
-            cout << "Query " << host << endl;
-            DnsResolverHelper& resolver = rule.best_match(host);
-            if (resolver.as_answer) {
-                ip_address addr = resolver.dnsaddr.front().address();
-                string reply = make_dns_response_v4(buffer.get(), host, addr);
-                cout << "send reply" << endl;
-                usocket.send_to(asio::buffer(reply), *ep);
-            } else {
-                cout << "us dns: " << endl;
-            }
- 
-            for (auto& ep : resolver.dnsaddr) {
-                cout << "    " << ep.address().to_string() << endl;
-            }
-        }
-    }
-
-    void handle_upstream_response()
-    {
-
-    }
-
-private:
     int lineno;
+    
+    io_service& asio_service;
     udp_socket usocket;
     DnsRule& rule;
 };
@@ -388,14 +556,16 @@ private:
 
 int main()
 {
-    ifstream config("./dns-selector.rule");
+    ifstream rule_config("./dns-selector.rule");
     DnsRule rule;
-    rule.parse_dns_rule(config);
+    rule.parse_dns_rule(rule_config);
 
     asio::io_service io_service;
     DnsServer server{io_service, rule};
-    server.listen_configure("0.0.0.0", 53);
-    server.start_receive_dns_request();
+    server.listen_configure("0.0.0.0", 1053);
+    for (int i = 0; i < 8; i++) {
+        server.start_receive_dns_request();
+    }
     io_service.run();
     return 0;
 }
