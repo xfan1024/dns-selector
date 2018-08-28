@@ -31,6 +31,37 @@ struct DnsResolverHelper {
     string name;
     vector<asio::ip::udp::endpoint> dnsaddr;
     bool as_answer;
+    friend ostream& operator<<(ostream& os, const DnsResolverHelper& resolver)
+    {
+        if (resolver.as_answer) {
+            os << "answer: ";
+        } else {
+            os << "dns server: ";
+        }
+        if (resolver.dnsaddr.empty()) {
+            os << " <empty>";
+        } else {
+            bool first = true;
+            for (auto& ep : resolver.dnsaddr) {
+                if (first) {
+                    first = false;
+                } else {
+                    os << ", ";
+                }
+                if (resolver.as_answer || ep.port() == 53) {
+                    os << ep.address().to_string();
+                } else {
+                    if (ep.address().is_v4()) {
+                        os << ep.address().to_string();
+                    } else {
+                        os << "[" << ep.address().to_string() << "]";
+                    }
+                    os << ":" << ep.port();
+                }
+            }
+        }
+        return os;
+    }
 };
 
 typedef vector<DnsResolverHelper> DnsResolverGroup;
@@ -288,6 +319,7 @@ public:
 private:
     void handle_upstream_response(const boost::system::error_code& ec,
                             shared_ptr<udp_ep> ep,
+                            shared_ptr<asio::deadline_timer> deadline_timer_ptr,
                             shared_ptr< vector<udp_socket> > dns_clients,
                             udp_socket& dns_client,
                             shared_ptr<uint8_t> buffer, 
@@ -300,6 +332,7 @@ private:
             cerr << __FUNCTION__ << ": " << ec.message() << endl;
             return;
         }
+        deadline_timer_ptr->cancel();
         usocket.send_to(asio::buffer(buffer.get(), nbytes), *ep);
         start_receive_dns_request();
         for (auto& client : *dns_clients) {
@@ -321,58 +354,49 @@ private:
         
         DnsResolverHelper * resolver_ptr = nullptr;
         if (parse_dns_request(buffer.get(), nbytes, type, host)) {
-            cout << "Query " << host << endl;
+            cout << "query " << host;
             DnsResolverHelper& r = rule.best_match(host);
             resolver_ptr = &r;
         } else {
-            cout << "could parse request, so using default resolver" << endl;
+            cout << "could parse request, so using default resolver";
             DnsResolverHelper& r = rule.default_resolver();
             resolver_ptr = &r;
         }
 
 
         DnsResolverHelper& resolver = *resolver_ptr;
-
-        cout << "    ";
-        if (resolver.as_answer) {
-            cout << "          answer: ";
-        } else {
-            cout << "using dns server: ";
-        }
-        if (resolver.dnsaddr.empty()) {
-            cout << " <empty>";
-        } else {
-            bool first = true;
-            for (auto& ep : resolver.dnsaddr) {
-                if (first) {
-                    first = false;
-                } else {
-                    cout << ", ";
-                }
-                if (resolver.as_answer || ep.port() == 53) {
-                    cout << ep.address().to_string();
-                } else {
-                    if (ep.address().is_v4()) {
-                        cout << ep.address().to_string();
-                    } else {
-                        cout << "[" << ep.address().to_string() << "]";
-                    }
-                    cout << ":" << ep.port();
-                }
-            }
-        }
-        cout << endl;
-
+        cout << ": " << resolver << endl;
         if (resolver.as_answer) {
             string reply = make_dns_response(buffer.get(), type, host, resolver.dnsaddr);
             usocket.send_to(asio::buffer(reply), *ep);
             start_receive_dns_request();
         } else {
+            if (resolver.dnsaddr.empty()) {
+                cout << "dns server list is empty, ignore this request" << endl;
+                start_receive_dns_request();
+                return;
+            }
+
             const size_t bufsize = 768;
             shared_ptr<uint8_t> buffer_for_upstream(new uint8_t[bufsize]);
             shared_ptr< vector<udp_socket> > dns_clients(new vector<udp_socket>);
             auto recvbuf = asio::buffer(buffer_for_upstream.get(), bufsize);
             namespace ph = asio::placeholders;
+            shared_ptr<asio::deadline_timer> deadline_timer_ptr(new asio::deadline_timer(asio_service, boost::posix_time::seconds(4)));
+            
+            auto timeout_callback = [this, &dns_clients, deadline_timer_ptr, &resolver](const boost::system::error_code& ec) {
+                if (ec) {
+                    return;
+                }
+                cout << "request upstream timeout: " << resolver << endl;
+                for (auto& client : *dns_clients) {
+                    client.close();
+                }
+                start_receive_dns_request();
+                return;
+            };
+
+            deadline_timer_ptr->async_wait(timeout_callback);
 
             for (auto& server : resolver.dnsaddr) {
                 dns_clients->emplace_back(asio_service);
@@ -384,7 +408,7 @@ private:
                     dns_client.open(asio::ip::udp::v6());
                 }
                 dns_client.connect(server);
-                auto callback = boost::bind(&DnsServer::handle_upstream_response, this, ph::error, ep, dns_clients, ref(dns_client), buffer_for_upstream, ph::bytes_transferred);
+                auto callback = boost::bind(&DnsServer::handle_upstream_response, this, ph::error, ep, deadline_timer_ptr, dns_clients, ref(dns_client), buffer_for_upstream, ph::bytes_transferred);
                 dns_client.send(asio::buffer(buffer.get(), nbytes));
                 dns_client.async_receive(recvbuf, callback);
             }
@@ -563,7 +587,7 @@ int main()
     asio::io_service io_service;
     DnsServer server{io_service, rule};
     server.listen_configure("0.0.0.0", 1053);
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 1; i++) {
         server.start_receive_dns_request();
     }
     io_service.run();
