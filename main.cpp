@@ -14,6 +14,7 @@ namespace regns = std;
 #include <boost/regex.hpp>
 namespace regns = boost;
 #endif
+#include <boost/program_options.hpp>
 #include <boost/asio.hpp>
 #include <boost/system/error_code.hpp>
 #include <boost/bind.hpp>
@@ -21,18 +22,30 @@ namespace regns = boost;
 #include "utils.hpp"
 
 using namespace std;
-namespace asio = boost::asio;
+
+namespace posix_time = boost::posix_time;
+
+namespace asio      = boost::asio;
+using io_service    = asio::io_service;
+using ip_address    = asio::ip::address;
+using ip_address_v4 = asio::ip::address_v4;
+using ip_address_v6 = asio::ip::address_v6;
+using udp_ep        = asio::ip::udp::endpoint;
+using udp_socket    = asio::ip::udp::socket;
+
+using boost_error   = boost::system::error_code;
+
+namespace po        = boost::program_options;
 
 static regns::regex pattern_start_resolver(R"(^\[([^\[\]]+)\]$)");
 
-static bool endpoint_from_string(string s, asio::ip::udp::endpoint& ep)
+static bool endpoint_from_string(string s, udp_ep& ep)
 {
     static regns::regex pattern_v4_endpoint(R"(^([^:]+):(\d+)$)");
     static regns::regex pattern_v6_endpoint(R"(^\[([^\[\]]+)\]:(\d+)$)");
 
-    using ip_address = asio::ip::address;
     regns::smatch match;
-    boost::system::error_code ec;
+    boost_error ec;
 
     if (regns::regex_match(s, match, pattern_v4_endpoint) || regns::regex_match(s, match, pattern_v6_endpoint)) {
         ip_address ip = ip_address::from_string(match[1].str(), ec);
@@ -40,21 +53,33 @@ static bool endpoint_from_string(string s, asio::ip::udp::endpoint& ep)
         if (ec || port_integer < 0 || port_integer > 0xffff) {
             return false;
         }
-        ep = asio::ip::udp::endpoint(ip, (unsigned short)port_integer);
+        ep = udp_ep(ip, (unsigned short)port_integer);
     } else {
         ip_address ip = ip_address::from_string(s, ec);
         if (ec) {
             return false;
         }
-        ep = asio::ip::udp::endpoint(ip, 53);
+        ep = udp_ep(ip, 53);
     }
     return true;
+}
+
+static string endpoint_to_string(const udp_ep& ep)
+{
+    stringstream ss;
+    if (ep.address().is_v4()) {
+        ss << ep.address().to_string();
+    } else {
+        ss << "[" << ep.address().to_string() << "]";
+    }
+    ss << ":" << ep.port();
+    return ss.str();
 }
 
 
 struct DnsResolverHelper {
     string name;
-    vector<asio::ip::udp::endpoint> dnsaddr;
+    vector<udp_ep> dnsaddr;
     bool as_answer;
     friend ostream& operator<<(ostream& os, const DnsResolverHelper& resolver)
     {
@@ -76,12 +101,7 @@ struct DnsResolverHelper {
                 if (resolver.as_answer || ep.port() == 53) {
                     os << ep.address().to_string();
                 } else {
-                    if (ep.address().is_v4()) {
-                        os << ep.address().to_string();
-                    } else {
-                        os << "[" << ep.address().to_string() << "]";
-                    }
-                    os << ":" << ep.port();
+                    os << endpoint_to_string(ep);
                 }
             }
         }
@@ -89,28 +109,40 @@ struct DnsResolverHelper {
     }
 };
 
-typedef vector<DnsResolverHelper> DnsResolverGroup;
+using DnsResolverGroup = vector<DnsResolverHelper>;
 
 struct DnsConfig
 {
-    using udp_ep     = asio::ip::udp::endpoint;
-    using ip_address = asio::ip::address;
-
     udp_ep  bindaddr;
     string  rulefile;
     int     max_conn;
 
-    DnsConfig()
+    DnsConfig(int argc, char* argv[])
     {
-        bindaddr = udp_ep(ip_address::from_string("0.0.0.0"), 1053);
-        rulefile = "/etc/dns-selector.rule";
-        max_conn = 8;
+        po::options_description desc("Allowed options");
+        desc.add_options()
+            ("help,h", "print help message")
+            ("listen,l", po::value<string>()->default_value("127.0.0.1:1053"), "listen address")
+            ("rule,r", po::value<string>()->default_value("/etc/dns-selector.rule"), "rule file")
+            ("max_conn,m", po::value<int>()->default_value(8), "number of dns request handle at same time")
+        ;
+        po::variables_map vm;
+        po::store(po::parse_command_line(argc, argv, desc), vm);
+        if (vm.count("help")) {
+            cout << desc << endl;
+            exit(1);
+        }
+        string listenstr = vm["listen"].as<string>();
+        if (!endpoint_from_string(listenstr, bindaddr)) {
+            cerr << "error: bad listen address " << listenstr << endl;
+            exit(1);
+        }
+        rulefile = vm["rule"].as<string>();
+        max_conn = vm["max_conn"].as<int>();
+        cout << "listen on: " << endpoint_to_string(bindaddr) << endl;
+        cout << " max_conn: " << max_conn << endl;
+        cout << " rulefile: " << rulefile << endl;
     }
-
-    void parse(int argc, char* argv[])
-    {
-    }
-
 };
 
 struct DomainNode
@@ -121,8 +153,6 @@ struct DomainNode
 };
 
 class DnsRule {
-    using ip_address = asio::ip::address;
-    using udp_ep     = asio::ip::udp::endpoint;
 public:
     void parse_dns_rule(istream & stream)
     {
@@ -316,14 +346,17 @@ private:
 
 class DnsServer
 {
-    using udp_socket = asio::ip::udp::socket;
-    using io_service = asio::io_service;
-    using ip_address = asio::ip::address;
-    using udp_ep = asio::ip::udp::endpoint;
 public:
-    DnsServer(io_service& service, DnsConfig& config, DnsRule& rule) 
-        : asio_service(service), usocket(service), rule(rule), config(config)
-    {}
+    DnsServer(DnsConfig& config) 
+        : usocket(asio_service), config(config)
+    {
+        ifstream rule_config(config.rulefile);
+        if (!rule_config) {
+            cerr << "error: can not open rule file: " << config.rulefile << endl;
+            exit(1);
+        }
+        rule.parse_dns_rule(rule_config);
+    }
 
     void start()
     {
@@ -339,6 +372,7 @@ public:
         for (int i = 0; i < config.max_conn; i++) {
             start_receive_dns_request();
         }
+        asio_service.run();
     }
 
 
@@ -354,7 +388,7 @@ private:
         usocket.async_receive_from(recvbuf, *ep, boost::bind(&DnsServer::handle_dns_request, this, ph::error, ep, buffer, ph::bytes_transferred));
     }
 
-    void handle_upstream_response(const boost::system::error_code& ec,
+    void handle_upstream_response(const boost_error& ec,
                             shared_ptr<udp_ep> ep,
                             shared_ptr<asio::deadline_timer> deadline_timer_ptr,
                             shared_ptr< vector<udp_socket> > dns_clients,
@@ -377,7 +411,7 @@ private:
         }
     }
 
-    void handle_dns_request(const boost::system::error_code& ec,
+    void handle_dns_request(const boost_error& ec,
                             shared_ptr<udp_ep> ep, 
                             shared_ptr<uint8_t> buffer, 
                             size_t nbytes)
@@ -419,13 +453,13 @@ private:
             shared_ptr< vector<udp_socket> > dns_clients(new vector<udp_socket>);
             auto recvbuf = asio::buffer(buffer_for_upstream.get(), bufsize);
             namespace ph = asio::placeholders;
-            shared_ptr<asio::deadline_timer> deadline_timer_ptr(new asio::deadline_timer(asio_service, boost::posix_time::seconds(4)));
+            shared_ptr<asio::deadline_timer> deadline_timer_ptr(new asio::deadline_timer(asio_service, posix_time::seconds(3)));
             
-            auto timeout_callback = [this, &dns_clients, deadline_timer_ptr, &resolver](const boost::system::error_code& ec) {
+            auto timeout_callback = [this, dns_clients, deadline_timer_ptr, &resolver](const boost_error& ec) {
                 if (ec) {
                     return;
                 }
-                cout << "request upstream timeout: " << resolver << endl;
+                cerr << "error: request upstream timeout: " << resolver << endl;
                 for (auto& client : *dns_clients) {
                     client.close();
                 }
@@ -449,7 +483,6 @@ private:
                 dns_client.send(asio::buffer(buffer.get(), nbytes));
                 dns_client.async_receive(recvbuf, callback);
             }
-            // cerr << "all client send finish" << endl;
         }
     }
 
@@ -482,7 +515,7 @@ private:
             data[1] = 0xff;
             break;
         default:
-            cerr << "no support qtype: " << (int)type << endl;
+            cerr << "error: no support qtype: " << (int)type << endl;
             exit(1);
         }
     }
@@ -541,7 +574,7 @@ private:
         os.write((char*)data, len);
     }
 
-    static string make_dns_response(const uint8_t id[2], QType type, const string& host, const vector<boost::asio::ip::udp::endpoint> vaddr)
+    static string make_dns_response(const uint8_t id[2], QType type, const string& host, const vector<udp_ep> vaddr)
     {
         stringstream ss;
         uint8_t part_header[] = { 
@@ -552,8 +585,8 @@ private:
             0x00, 0x00,     // Additional RRs
         };
 
-        boost::asio::ip::address_v4 addr_v4;
-        boost::asio::ip::address_v6 addr_v6;
+        ip_address_v4 addr_v4;
+        ip_address_v6 addr_v6;
         bool reply_v4, reply_v6, v4, v6;
         v4 = v6 = reply_v4 = reply_v6 = false;
 
@@ -609,9 +642,9 @@ private:
 
     int lineno;
     
-    io_service& asio_service;
+    io_service asio_service;
     udp_socket usocket;
-    DnsRule& rule;
+    DnsRule rule;
     DnsConfig& config;
 };
 
@@ -619,23 +652,9 @@ private:
 
 int main(int argc, char *argv[])
 {
-    DnsConfig config;
-    config.parse(argc, argv);
-
-    ifstream rule_config(config.rulefile);
-    if (!rule_config) {
-        cerr << "can not open rule file: " << config.rulefile << endl;
-        exit(1);
-    }
-
-    DnsRule rule;
-    rule.parse_dns_rule(rule_config);
-
-    asio::io_service io_service;
-    DnsServer server{io_service, config, rule};
+    DnsConfig config(argc, argv);
+    DnsServer server(config);
     server.start();
-    io_service.run();
-    cerr << "bug: io_service.run() was exit" << endl;
     return 0;
 }
 
