@@ -449,10 +449,8 @@ private:
             }
 
             const size_t bufsize = 768;
-            shared_ptr<uint8_t> buffer_for_upstream(new uint8_t[bufsize]);
+            
             shared_ptr< vector<udp_socket> > dns_clients(new vector<udp_socket>);
-            auto recvbuf = asio::buffer(buffer_for_upstream.get(), bufsize);
-            namespace ph = asio::placeholders;
             shared_ptr<asio::deadline_timer> deadline_timer_ptr(new asio::deadline_timer(asio_service, posix_time::seconds(3)));
             
             auto timeout_callback = [this, dns_clients, deadline_timer_ptr, &resolver](const boost_error& ec) {
@@ -469,6 +467,7 @@ private:
 
             deadline_timer_ptr->async_wait(timeout_callback);
 
+            namespace ph = asio::placeholders;
             for (auto& server : resolver.dnsaddr) {
                 dns_clients->emplace_back(asio_service);
                 udp_socket& dns_client = dns_clients->back();
@@ -479,6 +478,8 @@ private:
                     dns_client.open(asio::ip::udp::v6());
                 }
                 dns_client.connect(server);
+                shared_ptr<uint8_t> buffer_for_upstream(new uint8_t[bufsize]);
+                auto recvbuf = asio::buffer(buffer_for_upstream.get(), bufsize);
                 auto callback = boost::bind(&DnsServer::handle_upstream_response, this, ph::error, ep, deadline_timer_ptr, dns_clients, ref(dns_client), buffer_for_upstream, ph::bytes_transferred);
                 dns_client.send(asio::buffer(buffer.get(), nbytes));
                 dns_client.async_receive(recvbuf, callback);
