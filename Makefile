@@ -1,5 +1,5 @@
 
-CXX := g++
+CXX ?= g++
 
 .PHONY: .all
 
