@@ -1,9 +1,11 @@
-
-CXX ?= g++
+CXX      ?= g++
+CXXFLAGS ?= -std=c++11 -O3
+LDFLAGS  ?= -lboost_system -lboost_program_options -pthread
 
 .PHONY: .all
 
 all: dns-selector
 
 dns-selector:
-	$(CXX) -o dns-selector -std=c++11 -O3 main.cpp -s -lboost_system -lboost_program_options -pthread
+	$(CXX) -o dns-selector $(CXXFLAGS) main.cpp $(LDFLAGS)
+
