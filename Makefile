@@ -6,6 +6,6 @@ LDFLAGS  ?= -lboost_system -lboost_program_options -pthread
 
 all: dns-selector
 
-dns-selector:
+dns-selector: main.cpp utils.hpp
 	$(CXX) -o dns-selector $(CXXFLAGS) main.cpp $(LDFLAGS)
 

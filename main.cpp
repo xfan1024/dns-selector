@@ -379,6 +379,7 @@ public:
 private:
     void start_receive_dns_request()
     {
+        cout << __FUNCTION__ << "()" << endl;
         namespace ph = asio::placeholders;
         const size_t bufsize = 768;
         shared_ptr<uint8_t> buffer(new uint8_t[bufsize]);
@@ -468,21 +469,31 @@ private:
             deadline_timer_ptr->async_wait(timeout_callback);
 
             namespace ph = asio::placeholders;
-            for (auto& server : resolver.dnsaddr) {
-                dns_clients->emplace_back(asio_service);
-                udp_socket& dns_client = dns_clients->back();
+            try {
+                for (auto& server : resolver.dnsaddr) {
+                    dns_clients->emplace_back(asio_service);
+                    udp_socket& dns_client = dns_clients->back();
 
-                if (server.address().is_v4()) {
-                    dns_client.open(asio::ip::udp::v4());
-                } else {
-                    dns_client.open(asio::ip::udp::v6());
+                    if (server.address().is_v4()) {
+                        dns_client.open(asio::ip::udp::v4());
+                    } else {
+                        dns_client.open(asio::ip::udp::v6());
+                    }
+                    dns_client.connect(server);
+                    shared_ptr<uint8_t> buffer_for_upstream(new uint8_t[bufsize]);
+                    auto recvbuf = asio::buffer(buffer_for_upstream.get(), bufsize);
+                    auto callback = boost::bind(&DnsServer::handle_upstream_response, this, ph::error, ep, deadline_timer_ptr, dns_clients, ref(dns_client), buffer_for_upstream, ph::bytes_transferred);
+                    dns_client.send(asio::buffer(buffer.get(), nbytes));
+                    dns_client.async_receive(recvbuf, callback);
                 }
-                dns_client.connect(server);
-                shared_ptr<uint8_t> buffer_for_upstream(new uint8_t[bufsize]);
-                auto recvbuf = asio::buffer(buffer_for_upstream.get(), bufsize);
-                auto callback = boost::bind(&DnsServer::handle_upstream_response, this, ph::error, ep, deadline_timer_ptr, dns_clients, ref(dns_client), buffer_for_upstream, ph::bytes_transferred);
-                dns_client.send(asio::buffer(buffer.get(), nbytes));
-                dns_client.async_receive(recvbuf, callback);
+            } 
+            catch(const std::exception& e) {
+                cerr << __FUNCTION__ << ": " << e.what() << endl;
+                deadline_timer_ptr->cancel();
+                start_receive_dns_request();
+                for (auto& client : *dns_clients) {
+                    client.close();
+                }
             }
         }
     }
