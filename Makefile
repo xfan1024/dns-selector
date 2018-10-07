@@ -10,4 +10,4 @@ dns-selector: main.cpp utils.hpp
 	$(CXX) -o dns-selector $(CXXFLAGS) main.cpp $(LDFLAGS)
 
 clean: 
-	rm dns-selector
+	rm -f dns-selector
