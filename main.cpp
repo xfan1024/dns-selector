@@ -379,7 +379,6 @@ public:
 private:
     void start_receive_dns_request()
     {
-        cout << __FUNCTION__ << "()" << endl;
         namespace ph = asio::placeholders;
         const size_t bufsize = 768;
         shared_ptr<uint8_t> buffer(new uint8_t[bufsize]);
